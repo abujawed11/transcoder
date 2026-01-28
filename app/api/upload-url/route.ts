@@ -13,17 +13,17 @@ export async function POST(req: Request) {
       );
     }
 
-    const endpoint = process.env.MINIO_ENDPOINT!;
-    const region = process.env.MINIO_REGION || "us-east-1";
-    const bucket = process.env.MINIO_BUCKET!;
-    const accessKeyId = process.env.MINIO_ACCESS_KEY!;
-    const secretAccessKey = process.env.MINIO_SECRET_KEY!;
+    const region = process.env.AWS_REGION || "us-east-1";
+    const bucket = process.env.AWS_BUCKET!;
+    const accessKeyId = process.env.AWS_ACCESS_KEY_ID!;
+    const secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY!;
 
     const s3 = new S3Client({
       region,
-      endpoint,
       credentials: { accessKeyId, secretAccessKey },
-      forcePathStyle: true, // IMPORTANT for MinIO
+      // Disable automatic checksum - browsers can't compute CRC32
+      requestChecksumCalculation: "WHEN_REQUIRED",
+      responseChecksumValidation: "WHEN_REQUIRED",
     });
 
     // Store uploads under a prefix
@@ -38,7 +38,8 @@ export async function POST(req: Request) {
     // Signed URL valid for 5 minutes
     const url = await getSignedUrl(s3, cmd, { expiresIn: 60 * 5 });
 
-    return NextResponse.json({ url, key });
+    console.log("Generated signed URL:", url);
+    return NextResponse.json({ url, key, contentType });
   } catch (err: any) {
     return NextResponse.json(
       { error: err?.message || "Failed to create signed URL" },
