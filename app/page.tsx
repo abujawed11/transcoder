@@ -265,7 +265,7 @@ export default function HomePage() {
         <ul>
           <li>Chunk size: {formatFileSize(CHUNK_SIZE)}</li>
           <li>Parallel uploads: {PARALLEL_UPLOADS}</li>
-          <li>Region: ap-south-1 (Mumbai)</li>
+          <li>Storage: MinIO (local)</li>
         </ul>
       </div>
     </main>

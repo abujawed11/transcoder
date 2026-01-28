@@ -1,6 +1,21 @@
 import { NextResponse } from "next/server";
 import { S3Client, CompleteMultipartUploadCommand } from "@aws-sdk/client-s3";
 
+// Support both MinIO (local) and S3 (cloud)
+function getS3Client() {
+  const endpoint = process.env.S3_ENDPOINT;
+
+  return new S3Client({
+    region: process.env.S3_REGION || "us-east-1",
+    endpoint: endpoint || undefined,
+    forcePathStyle: !!endpoint,
+    credentials: {
+      accessKeyId: process.env.S3_ACCESS_KEY!,
+      secretAccessKey: process.env.S3_SECRET_KEY!,
+    },
+  });
+}
+
 export async function POST(req: Request) {
   try {
     const { key, uploadId, parts } = await req.json();
@@ -12,19 +27,13 @@ export async function POST(req: Request) {
       );
     }
 
-    const s3 = new S3Client({
-      region: process.env.AWS_REGION || "us-east-1",
-      credentials: {
-        accessKeyId: process.env.AWS_ACCESS_KEY_ID!,
-        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY!,
-      },
-    });
+    const s3 = getS3Client();
 
     // Sort parts by part number (required by S3)
     const sortedParts = parts.sort((a: any, b: any) => a.PartNumber - b.PartNumber);
 
     const command = new CompleteMultipartUploadCommand({
-      Bucket: process.env.AWS_BUCKET!,
+      Bucket: process.env.S3_BUCKET!,
       Key: key,
       UploadId: uploadId,
       MultipartUpload: {

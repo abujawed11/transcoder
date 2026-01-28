@@ -1,9 +1,32 @@
 import { NextResponse } from "next/server";
 import { S3Client, CreateMultipartUploadCommand } from "@aws-sdk/client-s3";
 
+// Support both MinIO (local) and S3 (cloud)
+function getS3Client() {
+  const endpoint = process.env.S3_ENDPOINT; // e.g., http://localhost:9000 for MinIO
+
+  return new S3Client({
+    region: process.env.S3_REGION || "us-east-1",
+    endpoint: endpoint || undefined,
+    forcePathStyle: !!endpoint, // Required for MinIO
+    credentials: {
+      accessKeyId: process.env.S3_ACCESS_KEY!,
+      secretAccessKey: process.env.S3_SECRET_KEY!,
+    },
+  });
+}
+
 export async function POST(req: Request) {
   try {
     const { filename, contentType } = await req.json();
+
+    console.log("Initiate upload:", { filename, contentType });
+    console.log("S3 config:", {
+      endpoint: process.env.S3_ENDPOINT,
+      region: process.env.S3_REGION,
+      bucket: process.env.S3_BUCKET,
+      hasAccessKey: !!process.env.S3_ACCESS_KEY,
+    });
 
     if (!filename || !contentType) {
       return NextResponse.json(
@@ -12,18 +35,12 @@ export async function POST(req: Request) {
       );
     }
 
-    const s3 = new S3Client({
-      region: process.env.AWS_REGION || "us-east-1",
-      credentials: {
-        accessKeyId: process.env.AWS_ACCESS_KEY_ID!,
-        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY!,
-      },
-    });
+    const s3 = getS3Client();
 
     const key = `uploads/${Date.now()}-${filename}`;
 
     const command = new CreateMultipartUploadCommand({
-      Bucket: process.env.AWS_BUCKET!,
+      Bucket: process.env.S3_BUCKET!,
       Key: key,
       ContentType: contentType,
     });
