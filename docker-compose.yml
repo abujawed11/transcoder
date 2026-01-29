@@ -15,7 +15,7 @@ services:
       - "9000:9000"
       - "9001:9001"
     volumes:
-      - minio-data:/data
+      - D:/minio-data:/data  # Explicitly use D: drive
 
   worker:
     build: ./worker
@@ -31,5 +31,4 @@ services:
       - redis
       - minio
 
-volumes:
-  minio-data:
+# Using bind mount to D:/minio-data instead of named volume
