@@ -1,23 +1,39 @@
 "use client";
 
-import { useState, useRef } from "react";
+import { useState, useRef, useCallback } from "react";
 
 // 10MB chunk size (S3 minimum is 5MB for multipart, except last part)
 const CHUNK_SIZE = 10 * 1024 * 1024;
-// Upload 4 chunks in parallel
+// Upload 4 chunks in parallel per file
 const PARALLEL_UPLOADS = 4;
+// Max concurrent file uploads
+const MAX_CONCURRENT_FILES = 3;
+
+type FileUploadStatus = "pending" | "uploading" | "completed" | "error";
+
+interface FileUploadState {
+  id: string;
+  file: File;
+  status: FileUploadStatus;
+  progress: number;
+  message: string;
+  error?: string;
+}
 
 export default function HomePage() {
-  const [file, setFile] = useState<File | null>(null);
-  const [status, setStatus] = useState<string>("");
-  const [progress, setProgress] = useState<number>(0);
+  const [files, setFiles] = useState<FileUploadState[]>([]);
   const [isUploading, setIsUploading] = useState(false);
-  const abortController = useRef<AbortController | null>(null);
+  const abortControllers = useRef<Map<string, AbortController>>(new Map());
 
+  // Update a specific file's state
+  const updateFileState = useCallback((id: string, updates: Partial<FileUploadState>) => {
+    setFiles(prev => prev.map(f => f.id === id ? { ...f, ...updates } : f));
+  }, []);
+
+  // Upload a single chunk
   async function uploadChunk(
     url: string,
     chunk: Blob,
-    partNumber: number,
     onProgress: (loaded: number) => void
   ): Promise<string> {
     return new Promise((resolve, reject) => {
@@ -31,7 +47,6 @@ export default function HomePage() {
 
       xhr.onload = () => {
         if (xhr.status === 200) {
-          // Get ETag from response header
           const etag = xhr.getResponseHeader("ETag");
           resolve(etag || "");
         } else {
@@ -47,18 +62,17 @@ export default function HomePage() {
     });
   }
 
-  async function handleUpload() {
-    if (!file) return;
-
-    setIsUploading(true);
-    setProgress(0);
-    abortController.current = new AbortController();
+  // Upload a single file
+  async function uploadSingleFile(fileState: FileUploadState): Promise<void> {
+    const { id, file } = fileState;
+    const controller = new AbortController();
+    abortControllers.current.set(id, controller);
 
     try {
+      updateFileState(id, { status: "uploading", message: "Preparing upload..." });
+
       const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
       const fileSizeMB = (file.size / (1024 * 1024)).toFixed(2);
-
-      setStatus(`Preparing upload (${fileSizeMB} MB, ${totalChunks} chunks)...`);
 
       // Step 1: Initiate multipart upload
       const initRes = await fetch("/api/multipart/initiate", {
@@ -70,12 +84,9 @@ export default function HomePage() {
         }),
       });
 
-      if (!initRes.ok) {
-        throw new Error("Failed to initiate upload");
-      }
+      if (!initRes.ok) throw new Error("Failed to initiate upload");
 
       const { uploadId, key } = await initRes.json();
-      console.log("Multipart upload initiated:", { uploadId, key });
 
       // Step 2: Get presigned URLs for all parts
       const partNumbers = Array.from({ length: totalChunks }, (_, i) => i + 1);
@@ -86,28 +97,25 @@ export default function HomePage() {
         body: JSON.stringify({ key, uploadId, partNumbers }),
       });
 
-      if (!presignRes.ok) {
-        throw new Error("Failed to get presigned URLs");
-      }
+      if (!presignRes.ok) throw new Error("Failed to get presigned URLs");
 
       const { presignedUrls } = await presignRes.json();
 
       // Step 3: Upload chunks in parallel with progress tracking
-      setStatus(`Uploading ${totalChunks} chunks (${PARALLEL_UPLOADS} parallel)...`);
-
       const completedParts: { PartNumber: number; ETag: string }[] = [];
       const chunkProgress: number[] = new Array(totalChunks).fill(0);
-      let totalUploaded = 0;
 
-      const updateTotalProgress = () => {
-        totalUploaded = chunkProgress.reduce((sum, p) => sum + p, 0);
+      const updateProgress = () => {
+        const totalUploaded = chunkProgress.reduce((sum, p) => sum + p, 0);
         const percent = Math.round((totalUploaded / file.size) * 100);
-        setProgress(percent);
         const uploadedMB = (totalUploaded / (1024 * 1024)).toFixed(2);
-        setStatus(`Uploading: ${uploadedMB} / ${fileSizeMB} MB (${percent}%)`);
+        updateFileState(id, {
+          progress: percent,
+          message: `Uploading: ${uploadedMB} / ${fileSizeMB} MB`,
+        });
       };
 
-      // Process chunks in batches for parallel upload
+      // Process chunks in batches
       for (let i = 0; i < totalChunks; i += PARALLEL_UPLOADS) {
         const batch = partNumbers.slice(i, i + PARALLEL_UPLOADS);
 
@@ -117,14 +125,13 @@ export default function HomePage() {
           const chunk = file.slice(start, end);
           const url = presignedUrls[partNumber];
 
-          const etag = await uploadChunk(url, chunk, partNumber, (loaded) => {
+          const etag = await uploadChunk(url, chunk, (loaded) => {
             chunkProgress[partNumber - 1] = loaded;
-            updateTotalProgress();
+            updateProgress();
           });
 
-          // Mark chunk as fully uploaded
           chunkProgress[partNumber - 1] = chunk.size;
-          updateTotalProgress();
+          updateProgress();
 
           return { PartNumber: partNumber, ETag: etag.replace(/"/g, "") };
         });
@@ -134,27 +141,18 @@ export default function HomePage() {
       }
 
       // Step 4: Complete multipart upload
-      setStatus("Finalizing upload...");
+      updateFileState(id, { message: "Finalizing upload..." });
 
       const completeRes = await fetch("/api/multipart/complete", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          key,
-          uploadId,
-          parts: completedParts,
-        }),
+        body: JSON.stringify({ key, uploadId, parts: completedParts }),
       });
 
-      if (!completeRes.ok) {
-        throw new Error("Failed to complete upload");
-      }
-
-      setProgress(100);
-      console.log("Upload complete:", key);
+      if (!completeRes.ok) throw new Error("Failed to complete upload");
 
       // Step 5: Queue transcode job
-      setStatus("Queueing transcode job...");
+      updateFileState(id, { message: "Queueing transcode job..." });
 
       const jobRes = await fetch("/api/submit-job", {
         method: "POST",
@@ -163,19 +161,91 @@ export default function HomePage() {
       });
 
       if (!jobRes.ok) {
-        setStatus(`✅ Uploaded, but job queue failed`);
+        updateFileState(id, {
+          status: "completed",
+          progress: 100,
+          message: "Uploaded, but job queue failed",
+        });
         return;
       }
 
-      setStatus(`✅ Upload complete! Transcoding queued for: ${key}`);
+      updateFileState(id, {
+        status: "completed",
+        progress: 100,
+        message: `Transcoding queued: ${key}`,
+      });
     } catch (err: any) {
-      console.error("Upload error:", err);
-      setStatus(`❌ Error: ${err?.message || "Upload failed"}`);
-      setProgress(0);
+      console.error(`Upload error for ${file.name}:`, err);
+      updateFileState(id, {
+        status: "error",
+        progress: 0,
+        message: err?.message || "Upload failed",
+        error: err?.message,
+      });
     } finally {
-      setIsUploading(false);
-      abortController.current = null;
+      abortControllers.current.delete(id);
     }
+  }
+
+  // Handle file selection
+  function handleFileSelect(e: React.ChangeEvent<HTMLInputElement>) {
+    const selectedFiles = e.target.files;
+    if (!selectedFiles || selectedFiles.length === 0) return;
+
+    const newFiles: FileUploadState[] = Array.from(selectedFiles).map((file) => ({
+      id: `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+      file,
+      status: "pending" as FileUploadStatus,
+      progress: 0,
+      message: "Ready to upload",
+    }));
+
+    setFiles(prev => [...prev, ...newFiles]);
+    e.target.value = ""; // Reset input to allow selecting same files again
+  }
+
+  // Upload all pending files with concurrency limit
+  async function handleUploadAll() {
+    const pendingFiles = files.filter(f => f.status === "pending");
+    if (pendingFiles.length === 0) return;
+
+    setIsUploading(true);
+
+    // Process files with concurrency limit
+    const queue = [...pendingFiles];
+    const activeUploads: Promise<void>[] = [];
+
+    while (queue.length > 0 || activeUploads.length > 0) {
+      // Start new uploads up to the concurrency limit
+      while (queue.length > 0 && activeUploads.length < MAX_CONCURRENT_FILES) {
+        const fileState = queue.shift()!;
+        const uploadPromise = uploadSingleFile(fileState).then(() => {
+          // Remove from active uploads when done
+          const index = activeUploads.indexOf(uploadPromise);
+          if (index > -1) activeUploads.splice(index, 1);
+        });
+        activeUploads.push(uploadPromise);
+      }
+
+      // Wait for at least one upload to complete
+      if (activeUploads.length > 0) {
+        await Promise.race(activeUploads);
+      }
+    }
+
+    setIsUploading(false);
+  }
+
+  // Remove a file from the list
+  function removeFile(id: string) {
+    const controller = abortControllers.current.get(id);
+    if (controller) controller.abort();
+    setFiles(prev => prev.filter(f => f.id !== id));
+  }
+
+  // Clear completed/errored files
+  function clearCompleted() {
+    setFiles(prev => prev.filter(f => f.status === "pending" || f.status === "uploading"));
   }
 
   function formatFileSize(bytes: number): string {
@@ -185,78 +255,208 @@ export default function HomePage() {
     return (bytes / (1024 * 1024 * 1024)).toFixed(2) + " GB";
   }
 
+  function getStatusColor(status: FileUploadStatus): string {
+    switch (status) {
+      case "pending": return "#9e9e9e";
+      case "uploading": return "#2196f3";
+      case "completed": return "#4caf50";
+      case "error": return "#f44336";
+    }
+  }
+
+  function getStatusIcon(status: FileUploadStatus): string {
+    switch (status) {
+      case "pending": return "○";
+      case "uploading": return "↑";
+      case "completed": return "✓";
+      case "error": return "✗";
+    }
+  }
+
+  const pendingCount = files.filter(f => f.status === "pending").length;
+  const uploadingCount = files.filter(f => f.status === "uploading").length;
+  const completedCount = files.filter(f => f.status === "completed").length;
+  const errorCount = files.filter(f => f.status === "error").length;
+
   return (
-    <main style={{ padding: 24, fontFamily: "sans-serif", maxWidth: 600 }}>
+    <main style={{ padding: 24, fontFamily: "sans-serif", maxWidth: 700 }}>
       <h1>Video Upload (S3 Multipart)</h1>
 
-      <div style={{ marginBottom: 16 }}>
-        <input
-          type="file"
-          accept="video/*"
-          onChange={(e) => setFile(e.target.files?.[0] ?? null)}
-          disabled={isUploading}
-        />
-      </div>
-
-      {file && (
-        <div style={{ marginBottom: 16, padding: 12, background: "#f5f5f5", borderRadius: 4 }}>
-          <strong>{file.name}</strong>
-          <br />
-          <span style={{ color: "#666" }}>
-            Size: {formatFileSize(file.size)} |
-            Type: {file.type || "unknown"} |
-            Chunks: {Math.ceil(file.size / CHUNK_SIZE)}
-          </span>
-        </div>
-      )}
-
-      <div style={{ marginBottom: 16 }}>
-        <button
-          onClick={handleUpload}
-          disabled={!file || isUploading}
+      {/* File Input */}
+      <div style={{ marginBottom: 16, display: "flex", gap: 12, alignItems: "center" }}>
+        <label
           style={{
             padding: "10px 20px",
-            fontSize: 16,
-            cursor: !file || isUploading ? "not-allowed" : "pointer",
+            background: "#f0f0f0",
+            borderRadius: 4,
+            cursor: "pointer",
+            border: "2px dashed #ccc",
           }}
         >
-          {isUploading ? "Uploading..." : "Upload"}
-        </button>
+          + Select Videos
+          <input
+            type="file"
+            accept="video/*"
+            multiple
+            onChange={handleFileSelect}
+            style={{ display: "none" }}
+          />
+        </label>
+        <span style={{ color: "#666", fontSize: 14 }}>
+          {files.length > 0 ? `${files.length} file(s) selected` : "No files selected"}
+        </span>
       </div>
 
-      {/* Progress Bar */}
-      {isUploading && (
-        <div style={{ marginBottom: 16 }}>
-          <div
+      {/* Action Buttons */}
+      {files.length > 0 && (
+        <div style={{ marginBottom: 16, display: "flex", gap: 12 }}>
+          <button
+            onClick={handleUploadAll}
+            disabled={pendingCount === 0 || isUploading}
             style={{
-              width: "100%",
-              height: 24,
-              background: "#e0e0e0",
+              padding: "10px 20px",
+              fontSize: 16,
+              background: pendingCount === 0 || isUploading ? "#ccc" : "#2196f3",
+              color: "white",
+              border: "none",
               borderRadius: 4,
-              overflow: "hidden",
+              cursor: pendingCount === 0 || isUploading ? "not-allowed" : "pointer",
             }}
           >
-            <div
+            {isUploading ? `Uploading (${uploadingCount}/${pendingCount + uploadingCount})...` : `Upload All (${pendingCount})`}
+          </button>
+          {(completedCount > 0 || errorCount > 0) && (
+            <button
+              onClick={clearCompleted}
               style={{
-                width: `${progress}%`,
-                height: "100%",
-                background: progress === 100 ? "#4caf50" : "#2196f3",
-                transition: "width 0.2s ease",
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                color: "white",
-                fontWeight: "bold",
-                fontSize: 12,
+                padding: "10px 20px",
+                fontSize: 16,
+                background: "#f5f5f5",
+                border: "1px solid #ccc",
+                borderRadius: 4,
+                cursor: "pointer",
               }}
             >
-              {progress > 5 ? `${progress}%` : ""}
-            </div>
-          </div>
+              Clear Completed
+            </button>
+          )}
         </div>
       )}
 
-      <p style={{ marginTop: 12, minHeight: 24 }}>{status}</p>
+      {/* Status Summary */}
+      {files.length > 0 && (
+        <div style={{ marginBottom: 16, fontSize: 14, color: "#666" }}>
+          <span style={{ marginRight: 16 }}>○ Pending: {pendingCount}</span>
+          <span style={{ marginRight: 16, color: "#2196f3" }}>↑ Uploading: {uploadingCount}</span>
+          <span style={{ marginRight: 16, color: "#4caf50" }}>✓ Completed: {completedCount}</span>
+          {errorCount > 0 && <span style={{ color: "#f44336" }}>✗ Errors: {errorCount}</span>}
+        </div>
+      )}
+
+      {/* File List */}
+      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        {files.map((fileState) => (
+          <div
+            key={fileState.id}
+            style={{
+              padding: 12,
+              background: "#f9f9f9",
+              borderRadius: 4,
+              border: `1px solid ${getStatusColor(fileState.status)}40`,
+              borderLeft: `4px solid ${getStatusColor(fileState.status)}`,
+            }}
+          >
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+              <div style={{ flex: 1 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <span style={{ color: getStatusColor(fileState.status), fontWeight: "bold" }}>
+                    {getStatusIcon(fileState.status)}
+                  </span>
+                  <strong style={{ wordBreak: "break-all" }}>{fileState.file.name}</strong>
+                </div>
+                <div style={{ fontSize: 12, color: "#666", marginTop: 4 }}>
+                  {formatFileSize(fileState.file.size)} | {Math.ceil(fileState.file.size / CHUNK_SIZE)} chunks
+                </div>
+              </div>
+              {(fileState.status === "pending" || fileState.status === "completed" || fileState.status === "error") && (
+                <button
+                  onClick={() => removeFile(fileState.id)}
+                  style={{
+                    background: "none",
+                    border: "none",
+                    cursor: "pointer",
+                    fontSize: 18,
+                    color: "#999",
+                    padding: "0 4px",
+                  }}
+                  title="Remove"
+                >
+                  ×
+                </button>
+              )}
+            </div>
+
+            {/* Progress Bar */}
+            {(fileState.status === "uploading" || fileState.status === "completed") && (
+              <div
+                style={{
+                  marginTop: 8,
+                  width: "100%",
+                  height: 20,
+                  background: "#e0e0e0",
+                  borderRadius: 4,
+                  overflow: "hidden",
+                }}
+              >
+                <div
+                  style={{
+                    width: `${fileState.progress}%`,
+                    height: "100%",
+                    background: fileState.status === "completed" ? "#4caf50" : "#2196f3",
+                    transition: "width 0.2s ease",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    color: "white",
+                    fontWeight: "bold",
+                    fontSize: 11,
+                  }}
+                >
+                  {fileState.progress > 10 ? `${fileState.progress}%` : ""}
+                </div>
+              </div>
+            )}
+
+            {/* Status Message */}
+            <div
+              style={{
+                marginTop: 6,
+                fontSize: 12,
+                color: fileState.status === "error" ? "#f44336" : "#666",
+              }}
+            >
+              {fileState.message}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {files.length === 0 && (
+        <div
+          style={{
+            padding: 40,
+            textAlign: "center",
+            background: "#f9f9f9",
+            borderRadius: 8,
+            border: "2px dashed #ddd",
+            color: "#999",
+          }}
+        >
+          <div style={{ fontSize: 48, marginBottom: 8 }}>🎬</div>
+          <div>Select video files to upload</div>
+          <div style={{ fontSize: 12, marginTop: 4 }}>Multiple files supported</div>
+        </div>
+      )}
 
       <hr style={{ margin: "24px 0" }} />
 
@@ -264,7 +464,8 @@ export default function HomePage() {
         <strong>Upload Settings:</strong>
         <ul>
           <li>Chunk size: {formatFileSize(CHUNK_SIZE)}</li>
-          <li>Parallel uploads: {PARALLEL_UPLOADS}</li>
+          <li>Parallel chunk uploads: {PARALLEL_UPLOADS}</li>
+          <li>Concurrent file uploads: {MAX_CONCURRENT_FILES}</li>
           <li>Storage: MinIO (local)</li>
         </ul>
       </div>
