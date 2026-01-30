@@ -1,8 +1,8 @@
 import { Worker } from "bullmq";
 import { Redis } from "ioredis";
-import { execFile } from "node:child_process";
+import { spawn, execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdir, rm } from "node:fs/promises";
+import { mkdir, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -22,11 +22,10 @@ const redis = new Redis({
   maxRetriesPerRequest: null,
 });
 
-// Support both MinIO (local) and S3 (cloud)
 const s3 = new S3Client({
   region: process.env.S3_REGION || "us-east-1",
   endpoint: process.env.S3_ENDPOINT || undefined,
-  forcePathStyle: !!process.env.S3_ENDPOINT, // Required for MinIO
+  forcePathStyle: !!process.env.S3_ENDPOINT,
   credentials: {
     accessKeyId: process.env.S3_ACCESS_KEY,
     secretAccessKey: process.env.S3_SECRET_KEY,
@@ -35,26 +34,27 @@ const s3 = new S3Client({
 
 const BUCKET = process.env.S3_BUCKET;
 
+// Track active ffmpeg processes for cancellation
+const activeProcesses = new Map();
+
 // ============================================================================
-// QUALITY PRESETS - Only renditions <= source resolution will be generated
+// DEFAULT QUALITY PRESETS
 // ============================================================================
-// CRF (Constant Rate Factor): Lower = better quality, larger file
-// - CRF 18-20: Visually lossless for most content
-// - CRF 23: Default, good balance
-// - CRF 28: Lower quality, smaller files
-//
-// maxBitrate: Safety cap to prevent bloated files (especially for high-motion content)
-// ============================================================================
-const QUALITY_PRESETS = [
-  { name: "1080p", height: 1080, crf: 23, maxBitrate: "5000k", audioBitrate: "128k" },
-  { name: "720p",  height: 720,  crf: 23, maxBitrate: "2500k", audioBitrate: "128k" },
-  { name: "480p",  height: 480,  crf: 24, maxBitrate: "1000k", audioBitrate: "96k" },
-  { name: "360p",  height: 360,  crf: 26, maxBitrate: "600k",  audioBitrate: "64k" },
+const DEFAULT_QUALITY_PRESETS = [
+  { name: "1080p", height: 1080, maxBitrate: "5000k", audioBitrate: "128k" },
+  { name: "720p",  height: 720,  maxBitrate: "2500k", audioBitrate: "128k" },
+  { name: "480p",  height: 480,  maxBitrate: "1000k", audioBitrate: "96k" },
+  { name: "360p",  height: 360,  maxBitrate: "600k",  audioBitrate: "64k" },
 ];
 
 // ============================================================================
 // HELPER FUNCTIONS
 // ============================================================================
+
+async function checkCancelled(jobId) {
+  const cancelled = await redis.get(`job:${jobId}:cancelled`);
+  return cancelled === "true";
+}
 
 async function streamToBuffer(stream) {
   const chunks = [];
@@ -87,10 +87,6 @@ async function uploadObject(key, filePath, contentType) {
   await upload.done();
 }
 
-/**
- * Get video metadata using ffprobe
- * Returns: { width, height, duration, bitrate }
- */
 async function getVideoInfo(inputPath) {
   const { stdout } = await execFileAsync("ffprobe", [
     "-v", "error",
@@ -113,56 +109,69 @@ async function getVideoInfo(inputPath) {
   };
 }
 
-/**
- * Filter quality presets to only include renditions <= source height
- * This prevents upscaling which wastes resources and inflates file size
- */
-function getApplicablePresets(sourceHeight) {
-  return QUALITY_PRESETS.filter((preset) => preset.height <= sourceHeight);
+function runFfmpeg(args, jobId, processKey) {
+  return new Promise((resolve, reject) => {
+    const ffmpeg = spawn("ffmpeg", args);
+    const key = `${jobId}-${processKey}`;
+
+    activeProcesses.set(key, ffmpeg);
+
+    let stderr = "";
+
+    ffmpeg.stderr.on("data", (data) => {
+      stderr += data.toString();
+    });
+
+    ffmpeg.on("close", (code) => {
+      activeProcesses.delete(key);
+
+      if (code === 0) {
+        resolve({ stdout: "", stderr });
+      } else if (code === 255 || code === null) {
+        reject(new Error("CANCELLED"));
+      } else {
+        reject(new Error(`FFmpeg exited with code ${code}: ${stderr.slice(-500)}`));
+      }
+    });
+
+    ffmpeg.on("error", (err) => {
+      activeProcesses.delete(key);
+      reject(err);
+    });
+  });
+}
+
+function killProcessesForJob(jobId) {
+  for (const [key, process] of activeProcesses) {
+    if (key.startsWith(`${jobId}-`)) {
+      console.log(`🛑 Killing ffmpeg process: ${key}`);
+      process.kill("SIGKILL");
+      activeProcesses.delete(key);
+    }
+  }
 }
 
 /**
- * Run ffmpeg with the given arguments
+ * Build ffmpeg arguments with custom settings
  */
-function runFfmpeg(args) {
-  return execFileAsync("ffmpeg", args, { maxBuffer: 1024 * 1024 * 50 });
-}
+function buildFfmpegArgs(inputPath, outputPath, preset, settings) {
+  const { crf, ffmpegPreset } = settings;
 
-/**
- * Build ffmpeg arguments for CRF-based encoding with bitrate cap
- *
- * Why this approach:
- * - CRF gives consistent quality regardless of content complexity
- * - maxrate + bufsize prevent file size explosion on high-motion scenes
- * - No upscaling = no wasted bits on fake detail
- */
-function buildFfmpegArgs(inputPath, outputPath, preset) {
   return [
-    "-y",                              // Overwrite output
-    "-i", inputPath,                   // Input file
-
-    // Video scaling (height-based, maintain aspect ratio)
+    "-y",
+    "-i", inputPath,
     "-vf", `scale=-2:${preset.height}`,
-
-    // Video codec: H.264 with CRF quality control
     "-c:v", "libx264",
-    "-preset", "medium",               // Better compression than veryfast
-    "-crf", String(preset.crf),        // Quality target
-    "-maxrate", preset.maxBitrate,     // Bitrate ceiling (prevents bloat)
-    "-bufsize", preset.maxBitrate,     // VBV buffer size = maxrate (1 second buffer)
-
-    // Encoding profile for compatibility
+    "-preset", ffmpegPreset,
+    "-crf", String(crf),
+    "-maxrate", preset.maxBitrate,
+    "-bufsize", preset.maxBitrate,
     "-profile:v", "high",
     "-level:v", "4.1",
-
-    // Audio: AAC with reasonable bitrate
     "-c:a", "aac",
     "-b:a", preset.audioBitrate,
-    "-ac", "2",                        // Stereo
-
-    // Output container optimization
-    "-movflags", "+faststart",         // Enable streaming playback
-
+    "-ac", "2",
+    "-movflags", "+faststart",
     outputPath,
   ];
 }
@@ -171,19 +180,60 @@ function safeNameFromKey(key) {
   return key.replaceAll("/", "_").replaceAll(" ", "_");
 }
 
+/**
+ * Encode a single quality preset
+ */
+async function encodeQuality(inputPath, workDir, preset, jobId, settings) {
+  const outputPath = path.join(workDir, `${preset.name}.mp4`);
+
+  console.log(`🔄 [${preset.name}] Encoding (preset: ${settings.ffmpegPreset}, CRF: ${settings.crf})...`);
+
+  const ffmpegArgs = buildFfmpegArgs(inputPath, outputPath, preset, settings);
+  await runFfmpeg(ffmpegArgs, jobId, preset.name);
+
+  const outputStat = await stat(outputPath);
+  const outputSizeMB = (outputStat.size / (1024 * 1024)).toFixed(2);
+
+  console.log(`✅ [${preset.name}] Done (${outputSizeMB} MB)`);
+
+  return {
+    name: preset.name,
+    localPath: outputPath,
+    size: outputStat.size,
+  };
+}
+
 // ============================================================================
 // WORKER
 // ============================================================================
 
-new Worker(
+const worker = new Worker(
   "video-transcode",
   async (job) => {
-    const { key } = job.data;
-    console.log(`🎬 Job ${job.id} started: ${key}`);
+    const { key, settings: jobSettings } = job.data;
+    const jobId = job.id;
+
+    // Merge default settings with job settings
+    const settings = {
+      crf: 23,
+      ffmpegPreset: "fast",
+      qualities: ["1080p", "720p", "480p", "360p"],
+      parallelEncodes: 2,
+      ...jobSettings,
+    };
+
+    console.log(`🎬 Job ${jobId} started: ${key}`);
+    console.log(`   Settings: preset=${settings.ffmpegPreset}, CRF=${settings.crf}, qualities=${settings.qualities.join(",")}, parallel=${settings.parallelEncodes}`);
+
     if (!key) throw new Error("Missing key in job.data");
 
+    if (await checkCancelled(jobId)) {
+      console.log(`⏹️ Job ${jobId} was cancelled before starting`);
+      throw new Error("Job cancelled");
+    }
+
     const base = safeNameFromKey(key);
-    const workDir = path.join(__dirname, "tmp", `${job.id}-${base}`);
+    const workDir = path.join(__dirname, "tmp", `${jobId}-${base}`);
 
     await mkdir(workDir, { recursive: true });
 
@@ -197,81 +247,98 @@ new Worker(
       console.log(`✅ Downloaded to ${inputPath}`);
       job.updateProgress(10);
 
-      // 2) Probe source video to get resolution
+      if (await checkCancelled(jobId)) {
+        throw new Error("CANCELLED");
+      }
+
+      // 2) Probe source video
       console.log(`🔍 Analyzing source video...`);
       const videoInfo = await getVideoInfo(inputPath);
-      console.log(`   Source: ${videoInfo.width}x${videoInfo.height}, ` +
-                  `duration: ${videoInfo.duration.toFixed(1)}s, ` +
-                  `bitrate: ${Math.round(videoInfo.bitrate / 1000)}kbps`);
+      console.log(`   Source: ${videoInfo.width}x${videoInfo.height}, duration: ${videoInfo.duration.toFixed(1)}s`);
 
-      // 3) Filter presets to avoid upscaling
-      const applicablePresets = getApplicablePresets(videoInfo.height);
+      // 3) Filter presets based on user selection and source resolution
+      let applicablePresets = DEFAULT_QUALITY_PRESETS
+        .filter(p => settings.qualities.includes(p.name))
+        .filter(p => p.height <= videoInfo.height);
 
       if (applicablePresets.length === 0) {
-        // Source is smaller than our smallest preset (360p)
-        // Just copy/re-encode at original size
-        console.log(`⚠️ Source (${videoInfo.height}p) is smaller than minimum preset (360p)`);
-        console.log(`   Will generate only a re-encoded copy at original resolution`);
+        // Source is smaller than all selected qualities
+        console.log(`⚠️ Source (${videoInfo.height}p) smaller than selected qualities, using original size`);
         applicablePresets.push({
           name: `${videoInfo.height}p`,
           height: videoInfo.height,
-          crf: 24,
           maxBitrate: "500k",
           audioBitrate: "64k",
         });
       }
 
-      console.log(`📋 Will generate ${applicablePresets.length} rendition(s): ` +
-                  `${applicablePresets.map(p => p.name).join(", ")}`);
-
-      // Log skipped renditions
-      const skippedPresets = QUALITY_PRESETS.filter(p => p.height > videoInfo.height);
-      if (skippedPresets.length > 0) {
-        console.log(`⏭️ Skipping ${skippedPresets.length} rendition(s) (would upscale): ` +
-                    `${skippedPresets.map(p => p.name).join(", ")}`);
-      }
-
+      console.log(`📋 Generating ${applicablePresets.length} rendition(s): ${applicablePresets.map(p => p.name).join(", ")}`);
       job.updateProgress(15);
 
-      // 4) Transcode to applicable quality levels only
-      const totalQualities = applicablePresets.length;
-      for (let i = 0; i < totalQualities; i++) {
-        const preset = applicablePresets[i];
-        const outputPath = path.join(workDir, `${preset.name}.mp4`);
+      // 4) Transcode with parallel encoding
+      const parallelEncodes = Math.min(settings.parallelEncodes, applicablePresets.length);
+      console.log(`🚀 Starting encoding (${parallelEncodes} parallel)...`);
 
-        console.log(`🔄 Transcoding to ${preset.name} (CRF ${preset.crf}, max ${preset.maxBitrate})...`);
+      const encodeResults = [];
+      const presetQueue = [...applicablePresets];
+      const activeEncodes = [];
+      let completedCount = 0;
 
-        const ffmpegArgs = buildFfmpegArgs(inputPath, outputPath, preset);
-        await runFfmpeg(ffmpegArgs);
+      while (presetQueue.length > 0 || activeEncodes.length > 0) {
+        if (await checkCancelled(jobId)) {
+          killProcessesForJob(jobId);
+          throw new Error("CANCELLED");
+        }
 
-        // Get output file size for logging
-        const { stat } = await import("node:fs/promises");
-        const outputStat = await stat(outputPath);
-        const outputSizeMB = (outputStat.size / (1024 * 1024)).toFixed(2);
+        while (presetQueue.length > 0 && activeEncodes.length < parallelEncodes) {
+          const preset = presetQueue.shift();
+          const encodePromise = encodeQuality(inputPath, workDir, preset, jobId, settings)
+            .then(result => {
+              completedCount++;
+              const progress = 15 + Math.round((completedCount / applicablePresets.length) * 65);
+              job.updateProgress(progress);
+              return result;
+            });
 
-        console.log(`✅ ${preset.name} done (${outputSizeMB} MB)`);
+          activeEncodes.push(encodePromise);
+        }
 
-        outputs[preset.name] = {
-          localPath: outputPath,
-          s3Key: key.replace("uploads/", `outputs/${preset.name}/`),
-          size: outputStat.size,
+        if (activeEncodes.length > 0) {
+          const completed = await Promise.race(activeEncodes.map((p, i) => p.then(r => ({ result: r, index: i }))));
+          encodeResults.push(completed.result);
+          activeEncodes.splice(completed.index, 1);
+        }
+      }
+
+      // Build outputs map
+      for (const result of encodeResults) {
+        outputs[result.name] = {
+          localPath: result.localPath,
+          s3Key: key.replace("uploads/", `outputs/${result.name}/`),
+          size: result.size,
         };
+      }
 
-        // Update progress (15% analysis + 65% transcoding distributed across qualities)
-        const progress = 15 + Math.round(((i + 1) / totalQualities) * 65);
-        job.updateProgress(progress);
+      if (await checkCancelled(jobId)) {
+        throw new Error("CANCELLED");
       }
 
       // 5) Upload all outputs to S3
-      console.log(`📤 Uploading ${totalQualities} transcoded file(s)...`);
+      console.log(`📤 Uploading ${encodeResults.length} transcoded file(s)...`);
       for (const [quality, { localPath, s3Key, size }] of Object.entries(outputs)) {
+        if (await checkCancelled(jobId)) {
+          throw new Error("CANCELLED");
+        }
+
         await uploadObject(s3Key, localPath, "video/mp4");
         const sizeMB = (size / (1024 * 1024)).toFixed(2);
         console.log(`  ✅ Uploaded ${quality}: ${s3Key} (${sizeMB} MB)`);
       }
 
       job.updateProgress(100);
-      console.log(`🎉 Job ${job.id} completed!`);
+      console.log(`🎉 Job ${jobId} completed!`);
+
+      await redis.del(`job:${jobId}:cancelled`);
 
       return {
         original: key,
@@ -280,16 +347,34 @@ new Worker(
           height: videoInfo.height,
           duration: videoInfo.duration,
         },
+        settings,
         outputs: Object.fromEntries(
           Object.entries(outputs).map(([q, { s3Key, size }]) => [q, { key: s3Key, size }])
         ),
       };
+    } catch (err) {
+      if (err.message === "CANCELLED") {
+        console.log(`⏹️ Job ${jobId} was cancelled`);
+        await redis.del(`job:${jobId}:cancelled`);
+      }
+      throw err;
     } finally {
-      // Cleanup temp files
       await rm(workDir, { recursive: true, force: true });
     }
   },
   { connection: redis }
 );
 
-console.log("✅ Worker started: listening on queue video-transcode");
+worker.on("failed", (job, err) => {
+  if (err.message === "CANCELLED" || err.message === "Job cancelled" || err.message?.includes("Cancelled")) {
+    console.log(`⏹️ Job ${job?.id} cancelled`);
+  } else {
+    console.error(`❌ Job ${job?.id} failed:`, err.message);
+  }
+});
+
+worker.on("completed", (job) => {
+  console.log(`✅ Job ${job.id} completed successfully`);
+});
+
+console.log("✅ Worker started (CPU encoding): listening on queue video-transcode");

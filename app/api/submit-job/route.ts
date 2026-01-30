@@ -1,8 +1,15 @@
 import { NextResponse } from "next/server";
 import { videoQueue } from "@/lib/videoQueue";
 
+export interface TranscodeSettings {
+  crf: number;
+  ffmpegPreset: string;
+  qualities: string[];
+  parallelEncodes: number;
+}
+
 export async function POST(req: Request) {
-  const { key } = await req.json();
+  const { key, settings } = await req.json();
 
   if (!key) {
     return NextResponse.json(
@@ -11,9 +18,13 @@ export async function POST(req: Request) {
     );
   }
 
-  await videoQueue.add("transcode", {
+  const job = await videoQueue.add("transcode", {
     key,
+    settings: settings || {},
   });
 
-  return NextResponse.json({ status: "queued" });
+  return NextResponse.json({
+    status: "queued",
+    jobId: job.id,
+  });
 }
