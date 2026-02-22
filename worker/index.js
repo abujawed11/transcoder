@@ -1,3 +1,4 @@
+import "dotenv/config";
 import { Worker } from "bullmq";
 import { Redis } from "ioredis";
 import { spawn, execFile } from "node:child_process";
@@ -161,9 +162,10 @@ function buildFfmpegArgs(inputPath, outputPath, preset, settings) {
     "-y",
     "-i", inputPath,
     "-vf", `scale=-2:${preset.height}`,
-    "-c:v", "libx264",
-    "-preset", ffmpegPreset,
-    "-crf", String(crf),
+    "-c:v", "h264_nvenc",
+    "-preset", "p4",
+    "-cq", String(crf),
+    "-rc", "vbr",
     "-maxrate", preset.maxBitrate,
     "-bufsize", preset.maxBitrate,
     "-profile:v", "high",
