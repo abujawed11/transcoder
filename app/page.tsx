@@ -2,6 +2,8 @@
 
 import { useState, useRef, useCallback, useEffect, DragEvent } from "react";
 
+const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:4001";
+
 const CHUNK_SIZE = 10 * 1024 * 1024;
 const PARALLEL_UPLOADS = 4;
 const MAX_CONCURRENT_FILES = 3;
@@ -18,6 +20,17 @@ interface FileUploadState {
   error?: string;
   jobId?: string;
   transcodeProgress?: number;
+}
+
+interface WsProgress {
+  jobId: string;
+  stage: "download" | "analyze" | "encode" | "upload" | "done" | "error";
+  rendition?: string;
+  percent: number;
+  speed?: string;
+  fps?: number;
+  message?: string;
+  ts: number;
 }
 
 interface TranscodeSettings {
@@ -59,6 +72,13 @@ export default function HomePage() {
   const abortControllers = useRef<Map<string, AbortController>>(new Map());
   const fileInputRef = useRef<HTMLInputElement>(null);
   const pollingRef = useRef<NodeJS.Timeout | null>(null);
+
+  // Live progress received from the WebSocket server
+  const [wsProgress, setWsProgress] = useState<Map<string, WsProgress>>(new Map());
+  const wsConnections = useRef<Map<string, WebSocket>>(new Map());
+  const wsReconnectTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+  // Ref so WS callbacks always see the latest files without stale closures
+  const filesRef = useRef<FileUploadState[]>([]);
 
   // Load settings from localStorage
   useEffect(() => {
@@ -131,6 +151,71 @@ export default function HomePage() {
       if (pollingRef.current) clearInterval(pollingRef.current);
     };
   }, [files, updateFileState]);
+
+  // Keep filesRef in sync so WS reconnect closures always see current state
+  filesRef.current = files;
+
+  // Open/close WebSocket connections as jobs start and finish transcoding
+  const connectWs = useCallback((jobId: string) => {
+    const ws = new WebSocket(`${WS_URL}/ws/progress`);
+    wsConnections.current.set(jobId, ws);
+
+    ws.onopen = () => ws.send(JSON.stringify({ type: "subscribe", jobId }));
+
+    ws.onmessage = (event) => {
+      try {
+        const payload = JSON.parse(event.data) as WsProgress;
+        setWsProgress(prev => { const m = new Map(prev); m.set(jobId, payload); return m; });
+      } catch { /* ignore malformed frames */ }
+    };
+
+    ws.onclose = () => {
+      wsConnections.current.delete(jobId);
+      // Reconnect after 2 s if the job is still active
+      const timer = setTimeout(() => {
+        wsReconnectTimers.current.delete(jobId);
+        if (filesRef.current.some(f => f.jobId === jobId && f.status === "transcoding")) {
+          connectWs(jobId);
+        }
+      }, 2000);
+      wsReconnectTimers.current.set(jobId, timer);
+    };
+
+    ws.onerror = () => ws.close();
+  }, []); // stable ref; all mutable state accessed via refs
+
+  useEffect(() => {
+    const activeJobIds = new Set(
+      files.filter(f => f.status === "transcoding" && f.jobId).map(f => f.jobId!)
+    );
+
+    // Open connections for newly queued transcoding jobs
+    for (const jobId of activeJobIds) {
+      if (!wsConnections.current.has(jobId)) connectWs(jobId);
+    }
+
+    // Close and clean up connections for finished jobs
+    for (const jobId of [...wsConnections.current.keys()]) {
+      if (!activeJobIds.has(jobId)) {
+        wsConnections.current.get(jobId)?.close();
+        wsConnections.current.delete(jobId);
+      }
+    }
+    for (const jobId of [...wsReconnectTimers.current.keys()]) {
+      if (!activeJobIds.has(jobId)) {
+        clearTimeout(wsReconnectTimers.current.get(jobId));
+        wsReconnectTimers.current.delete(jobId);
+      }
+    }
+  }, [files, connectWs]);
+
+  // Global cleanup on unmount
+  useEffect(() => {
+    return () => {
+      for (const ws of wsConnections.current.values()) ws.close();
+      for (const timer of wsReconnectTimers.current.values()) clearTimeout(timer);
+    };
+  }, []);
 
   async function uploadChunk(
     url: string,
@@ -905,23 +990,63 @@ export default function HomePage() {
                 </div>
               )}
 
-              {fileState.status === "transcoding" && (
-                <div style={{ marginTop: 12 }}>
-                  <div style={{ height: 6, background: "rgba(63, 63, 70, 0.5)", borderRadius: 3, overflow: "hidden" }}>
-                    <div style={{
-                      height: "100%", width: `${fileState.transcodeProgress || 0}%`, borderRadius: 3,
-                      background: "linear-gradient(90deg, #f59e0b 0%, #d97706 100%)",
-                      backgroundSize: "40px 40px",
-                      backgroundImage: "linear-gradient(45deg, rgba(255,255,255,0.1) 25%, transparent 25%, transparent 50%, rgba(255,255,255,0.1) 50%, rgba(255,255,255,0.1) 75%, transparent 75%, transparent)",
-                      animation: "progressStripe 1s linear infinite",
-                    }} />
+              {fileState.status === "transcoding" && (() => {
+                const ws = fileState.jobId ? wsProgress.get(fileState.jobId) : undefined;
+                // Use WS percent if available, fall back to BullMQ poll progress
+                const percent = ws ? ws.percent : (fileState.transcodeProgress || 0);
+                const stageLabel =
+                  ws?.stage === "download" ? "Downloading"
+                  : ws?.stage === "analyze" ? "Analyzing"
+                  : ws?.stage === "encode"  ? `Encoding ${ws.rendition ?? ""}`
+                  : ws?.stage === "upload"  ? "Uploading"
+                  : ws?.stage === "done"    ? "Done"
+                  : null;
+                const speedBadge = ws?.speed && ws.speed !== "N/A" && ws.speed !== "0x" ? ws.speed : null;
+                const displayMsg = stageLabel
+                  ? `${stageLabel}${speedBadge ? ` @ ${speedBadge}` : ""}`
+                  : fileState.message;
+
+                return (
+                  <div style={{ marginTop: 12 }}>
+                    {/* Stage + rendition + speed badges */}
+                    {ws && (
+                      <div style={{ display: "flex", gap: 6, marginBottom: 6, flexWrap: "wrap" }}>
+                        <span style={{
+                          fontSize: 11, padding: "2px 8px", borderRadius: 4, fontWeight: 600,
+                          background: ws.stage === "encode" ? "rgba(245,158,11,0.2)" : "rgba(102,126,234,0.2)",
+                          color: ws.stage === "encode" ? "#f59e0b" : "#667eea",
+                        }}>
+                          {stageLabel}
+                        </span>
+                        {ws.stage === "encode" && ws.rendition && (
+                          <span style={{ fontSize: 11, padding: "2px 8px", borderRadius: 4, background: "rgba(113,113,122,0.2)", color: "#a1a1aa" }}>
+                            {ws.rendition}
+                          </span>
+                        )}
+                        {speedBadge && (
+                          <span style={{ fontSize: 11, padding: "2px 8px", borderRadius: 4, background: "rgba(34,197,94,0.1)", color: "#22c55e" }}>
+                            {speedBadge}
+                          </span>
+                        )}
+                      </div>
+                    )}
+                    <div style={{ height: 6, background: "rgba(63, 63, 70, 0.5)", borderRadius: 3, overflow: "hidden" }}>
+                      <div style={{
+                        height: "100%", width: `${percent}%`, borderRadius: 3,
+                        background: "linear-gradient(90deg, #f59e0b 0%, #d97706 100%)",
+                        backgroundSize: "40px 40px",
+                        backgroundImage: "linear-gradient(45deg, rgba(255,255,255,0.1) 25%, transparent 25%, transparent 50%, rgba(255,255,255,0.1) 50%, rgba(255,255,255,0.1) 75%, transparent 75%, transparent)",
+                        animation: "progressStripe 1s linear infinite",
+                        transition: "width 0.25s ease",
+                      }} />
+                    </div>
+                    <div style={{ display: "flex", justifyContent: "space-between", marginTop: 6, fontSize: 12 }}>
+                      <span style={{ color: "#f59e0b" }}>{displayMsg}</span>
+                      <span style={{ color: "#71717a" }}>{Math.round(percent)}%</span>
+                    </div>
                   </div>
-                  <div style={{ display: "flex", justifyContent: "space-between", marginTop: 6, fontSize: 12 }}>
-                    <span style={{ color: "#f59e0b" }}>{fileState.message}</span>
-                    <span style={{ color: "#71717a" }}>{fileState.transcodeProgress || 0}%</span>
-                  </div>
-                </div>
-              )}
+                );
+              })()}
 
               {fileState.status === "completed" && (
                 <div style={{ marginTop: 12 }}>

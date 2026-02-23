@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls \"D:/react/video-transcoder/transcoder/\" 2>&1 || cmd.exe /c \"dir D:\\\\\\\\react\\\\\\\\video-transcoder\\\\\\\\transcoder\\\\\\\\\" 2>&1)",
+      "Bash(ls:*)",
+      "Bash(cd /d/react/video-transcoder/transcoder/ws-server && npm install 2>&1)",
+      "Bash(cd /d/react/video-transcoder/transcoder && npx tsc --noEmit 2>&1)",
+      "Bash(echo EXIT:$?:*)"
+    ]
+  }
+}

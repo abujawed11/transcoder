@@ -17,11 +17,17 @@ const execFileAsync = promisify(execFile);
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const redis = new Redis({
-  host: process.env.REDIS_HOST || "redis",
+const redisConfig = {
+  host: process.env.REDIS_HOST || "localhost",
   port: Number(process.env.REDIS_PORT || 6379),
   maxRetriesPerRequest: null,
-});
+};
+
+// BullMQ connection
+const redis = new Redis(redisConfig);
+
+// Separate pub/sub publisher (ioredis requires a dedicated connection for pub/sub)
+const pubClient = new Redis(redisConfig);
 
 const s3 = new S3Client({
   region: process.env.S3_REGION || "us-east-1",
@@ -37,6 +43,33 @@ const BUCKET = process.env.S3_BUCKET;
 
 // Track active ffmpeg processes for cancellation
 const activeProcesses = new Map();
+
+// Throttle map: jobId -> last publish timestamp (ms)
+const publishThrottle = new Map();
+
+// ============================================================================
+// PROGRESS PUB/SUB
+// ============================================================================
+
+/**
+ * Publish a progress payload to Redis channel `progress:<jobId>`.
+ * Also persists the latest payload as a Redis key (TTL 1h) for late-joining clients.
+ * Throttled to max 4 updates/second unless force=true.
+ *
+ * Payload shape:
+ *   { jobId, stage, rendition?, percent, speed?, fps?, message?, ts }
+ * Stages: "download" | "analyze" | "encode" | "upload" | "done" | "error"
+ */
+async function publishProgress(jobId, payload, force = false) {
+  const now = Date.now();
+  if (!force && now - (publishThrottle.get(jobId) || 0) < 250) return;
+  publishThrottle.set(jobId, now);
+
+  const channel = `progress:${jobId}`;
+  const msg = JSON.stringify({ ...payload, ts: now });
+  await pubClient.publish(channel, msg);
+  await pubClient.set(channel, msg, "EX", 3600);
+}
 
 // ============================================================================
 // DEFAULT QUALITY PRESETS
@@ -110,7 +143,12 @@ async function getVideoInfo(inputPath) {
   };
 }
 
-function runFfmpeg(args, jobId, processKey) {
+/**
+ * Spawn ffmpeg and parse structured progress from stdout (-progress pipe:1).
+ * Calls onProgress(frame) for each complete progress block, where frame contains
+ * fields like out_time_us, fps, speed, bitrate, etc.
+ */
+function runFfmpeg(args, jobId, processKey, onProgress) {
   return new Promise((resolve, reject) => {
     const ffmpeg = spawn("ffmpeg", args);
     const key = `${jobId}-${processKey}`;
@@ -118,6 +156,27 @@ function runFfmpeg(args, jobId, processKey) {
     activeProcesses.set(key, ffmpeg);
 
     let stderr = "";
+    let stdoutBuf = "";
+    let currentFrame = {};
+
+    // Parse -progress pipe:1 output: key=value lines, each block ends with "progress=continue|end"
+    ffmpeg.stdout.on("data", (data) => {
+      stdoutBuf += data.toString();
+      const lines = stdoutBuf.split("\n");
+      stdoutBuf = lines.pop(); // keep incomplete last line
+
+      for (const line of lines) {
+        const eqIdx = line.indexOf("=");
+        if (eqIdx === -1) continue;
+        const k = line.slice(0, eqIdx).trim();
+        const v = line.slice(eqIdx + 1).trim();
+        currentFrame[k] = v;
+        if (k === "progress") {
+          if (onProgress) onProgress({ ...currentFrame });
+          currentFrame = {};
+        }
+      }
+    });
 
     ffmpeg.stderr.on("data", (data) => {
       stderr += data.toString();
@@ -153,23 +212,26 @@ function killProcessesForJob(jobId) {
 }
 
 /**
- * Build ffmpeg arguments with custom settings
+ * Build ffmpeg arguments.
+ * Uses -progress pipe:1 -nostats for structured real-time progress on stdout.
+ * Encoder: h264_nvenc (GPU). Overall progress mapped per-rendition via out_time_us.
  */
 function buildFfmpegArgs(inputPath, outputPath, preset, settings) {
-  const { crf, ffmpegPreset } = settings;
+  const { crf } = settings;
 
   return [
     "-y",
+    "-progress", "pipe:1",  // structured progress → stdout
+    "-nostats",             // suppress normal stats from stderr
     "-i", inputPath,
     "-vf", `scale=-2:${preset.height}`,
     "-c:v", "h264_nvenc",
-    "-preset", "p4",
-    "-cq", String(crf),
-    "-rc", "vbr",
+    "-preset", "p4",        // p1 (fastest) … p7 (best quality)
+    "-rc", "vbr",           // variable bitrate quality mode
+    "-cq", String(crf),     // quality target (like CRF for libx264)
+    "-b:v", "0",            // required: no fixed bitrate target, let -cq control quality
     "-maxrate", preset.maxBitrate,
     "-bufsize", preset.maxBitrate,
-    "-profile:v", "high",
-    "-level:v", "4.1",
     "-c:a", "aac",
     "-b:a", preset.audioBitrate,
     "-ac", "2",
@@ -183,15 +245,28 @@ function safeNameFromKey(key) {
 }
 
 /**
- * Encode a single quality preset
+ * Encode a single quality preset and report per-frame progress.
+ *
+ * @param {number} duration - source video duration in seconds
+ * @param {(renditionName: string, percent: number, speed: string, fps: number) => void} onRenditionProgress
  */
-async function encodeQuality(inputPath, workDir, preset, jobId, settings) {
+async function encodeQuality(inputPath, workDir, preset, jobId, settings, duration, onRenditionProgress) {
   const outputPath = path.join(workDir, `${preset.name}.mp4`);
 
-  console.log(`🔄 [${preset.name}] Encoding (preset: ${settings.ffmpegPreset}, CRF: ${settings.crf})...`);
+  console.log(`🔄 [${preset.name}] Encoding (CRF: ${settings.crf})...`);
 
   const ffmpegArgs = buildFfmpegArgs(inputPath, outputPath, preset, settings);
-  await runFfmpeg(ffmpegArgs, jobId, preset.name);
+
+  await runFfmpeg(ffmpegArgs, jobId, preset.name, (frame) => {
+    // out_time_us is microseconds elapsed in output stream
+    const outTimeUs = parseInt(frame.out_time_us || frame.out_time_ms || "0", 10);
+    const percent = duration > 0
+      ? Math.min(100, (outTimeUs / (duration * 1e6)) * 100)
+      : 0;
+    const speed = frame.speed || "?";
+    const fps = parseFloat(frame.fps || "0");
+    if (onRenditionProgress) onRenditionProgress(preset.name, percent, speed, fps);
+  });
 
   const outputStat = await stat(outputPath);
   const outputSizeMB = (outputStat.size / (1024 * 1024)).toFixed(2);
@@ -225,7 +300,7 @@ const worker = new Worker(
     };
 
     console.log(`🎬 Job ${jobId} started: ${key}`);
-    console.log(`   Settings: preset=${settings.ffmpegPreset}, CRF=${settings.crf}, qualities=${settings.qualities.join(",")}, parallel=${settings.parallelEncodes}`);
+    console.log(`   Settings: CRF=${settings.crf}, qualities=${settings.qualities.join(",")}, parallel=${settings.parallelEncodes}`);
 
     if (!key) throw new Error("Missing key in job.data");
 
@@ -242,29 +317,43 @@ const worker = new Worker(
     const inputPath = path.join(workDir, "input.mp4");
     const outputs = {};
 
+    // Per-rendition encode progress: renditionName -> percent (0-100)
+    // Overall encode percent = average across all renditions, mapped to job range 15-80%.
+    const renditionProgress = new Map();
+
+    function getOverallEncodePercent() {
+      if (renditionProgress.size === 0) return 0;
+      const vals = [...renditionProgress.values()];
+      return vals.reduce((a, b) => a + b, 0) / vals.length;
+    }
+
     try {
-      // 1) Download original from S3
+      // ── Stage: download ──────────────────────────────────────────────────
+      await publishProgress(jobId, { jobId, stage: "download", percent: 0, message: `Downloading ${key}` }, true);
       console.log(`📥 Downloading ${key}...`);
       await downloadObject(key, inputPath);
       console.log(`✅ Downloaded to ${inputPath}`);
       job.updateProgress(10);
+      await publishProgress(jobId, { jobId, stage: "download", percent: 10, message: "Download complete" }, true);
 
-      if (await checkCancelled(jobId)) {
-        throw new Error("CANCELLED");
-      }
+      if (await checkCancelled(jobId)) throw new Error("CANCELLED");
 
-      // 2) Probe source video
+      // ── Stage: analyze ───────────────────────────────────────────────────
+      await publishProgress(jobId, { jobId, stage: "analyze", percent: 10, message: "Analyzing video" }, true);
       console.log(`🔍 Analyzing source video...`);
       const videoInfo = await getVideoInfo(inputPath);
       console.log(`   Source: ${videoInfo.width}x${videoInfo.height}, duration: ${videoInfo.duration.toFixed(1)}s`);
+      await publishProgress(jobId, {
+        jobId, stage: "analyze", percent: 15,
+        message: `${videoInfo.width}x${videoInfo.height}, ${videoInfo.duration.toFixed(1)}s`,
+      }, true);
 
-      // 3) Filter presets based on user selection and source resolution
+      // Filter presets based on user selection and source resolution
       let applicablePresets = DEFAULT_QUALITY_PRESETS
         .filter(p => settings.qualities.includes(p.name))
         .filter(p => p.height <= videoInfo.height);
 
       if (applicablePresets.length === 0) {
-        // Source is smaller than all selected qualities
         console.log(`⚠️ Source (${videoInfo.height}p) smaller than selected qualities, using original size`);
         applicablePresets.push({
           name: `${videoInfo.height}p`,
@@ -277,9 +366,17 @@ const worker = new Worker(
       console.log(`📋 Generating ${applicablePresets.length} rendition(s): ${applicablePresets.map(p => p.name).join(", ")}`);
       job.updateProgress(15);
 
-      // 4) Transcode with parallel encoding
+      // Initialize rendition progress to 0
+      for (const p of applicablePresets) renditionProgress.set(p.name, 0);
+
+      // ── Stage: encode ────────────────────────────────────────────────────
       const parallelEncodes = Math.min(settings.parallelEncodes, applicablePresets.length);
       console.log(`🚀 Starting encoding (${parallelEncodes} parallel)...`);
+
+      await publishProgress(jobId, {
+        jobId, stage: "encode", percent: 15,
+        message: `Encoding ${applicablePresets.map(p => p.name).join(", ")} (${parallelEncodes} parallel)`,
+      }, true);
 
       const encodeResults = [];
       const presetQueue = [...applicablePresets];
@@ -294,13 +391,32 @@ const worker = new Worker(
 
         while (presetQueue.length > 0 && activeEncodes.length < parallelEncodes) {
           const preset = presetQueue.shift();
-          const encodePromise = encodeQuality(inputPath, workDir, preset, jobId, settings)
-            .then(result => {
-              completedCount++;
-              const progress = 15 + Math.round((completedCount / applicablePresets.length) * 65);
-              job.updateProgress(progress);
-              return result;
-            });
+
+          const encodePromise = encodeQuality(
+            inputPath, workDir, preset, jobId, settings,
+            videoInfo.duration,
+            // Per-frame progress callback (throttled internally by publishProgress)
+            (renditionName, pct, speed, fps) => {
+              renditionProgress.set(renditionName, pct);
+              // Overall job percent: encode stage occupies 15-80%
+              const totalPercent = Math.round(15 + (getOverallEncodePercent() / 100) * 65);
+              publishProgress(jobId, {
+                jobId,
+                stage: "encode",
+                rendition: renditionName,
+                percent: totalPercent,
+                speed,
+                fps,
+                message: `Encoding ${renditionName} @ ${speed}`,
+              }).catch(() => {});
+            }
+          ).then(result => {
+            completedCount++;
+            renditionProgress.set(result.name, 100);
+            const progress = 15 + Math.round((completedCount / applicablePresets.length) * 65);
+            job.updateProgress(progress);
+            return result;
+          });
 
           activeEncodes.push(encodePromise);
         }
@@ -321,16 +437,19 @@ const worker = new Worker(
         };
       }
 
-      if (await checkCancelled(jobId)) {
-        throw new Error("CANCELLED");
-      }
+      if (await checkCancelled(jobId)) throw new Error("CANCELLED");
 
-      // 5) Upload all outputs to S3
+      // ── Stage: upload ────────────────────────────────────────────────────
+      const outputEntries = Object.entries(outputs);
       console.log(`📤 Uploading ${encodeResults.length} transcoded file(s)...`);
-      for (const [quality, { localPath, s3Key, size }] of Object.entries(outputs)) {
-        if (await checkCancelled(jobId)) {
-          throw new Error("CANCELLED");
-        }
+      await publishProgress(jobId, { jobId, stage: "upload", percent: 80, message: `Uploading ${encodeResults.length} file(s)` }, true);
+
+      for (let i = 0; i < outputEntries.length; i++) {
+        const [quality, { localPath, s3Key, size }] = outputEntries[i];
+        if (await checkCancelled(jobId)) throw new Error("CANCELLED");
+
+        const uploadPct = Math.round(80 + ((i + 1) / outputEntries.length) * 15);
+        await publishProgress(jobId, { jobId, stage: "upload", percent: uploadPct, message: `Uploading ${quality}` }, true);
 
         await uploadObject(s3Key, localPath, "video/mp4");
         const sizeMB = (size / (1024 * 1024)).toFixed(2);
@@ -340,7 +459,10 @@ const worker = new Worker(
       job.updateProgress(100);
       console.log(`🎉 Job ${jobId} completed!`);
 
+      // ── Stage: done ──────────────────────────────────────────────────────
+      await publishProgress(jobId, { jobId, stage: "done", percent: 100, message: "Transcoding complete" }, true);
       await redis.del(`job:${jobId}:cancelled`);
+      publishThrottle.delete(jobId);
 
       return {
         original: key,
@@ -357,8 +479,12 @@ const worker = new Worker(
     } catch (err) {
       if (err.message === "CANCELLED") {
         console.log(`⏹️ Job ${jobId} was cancelled`);
+        await publishProgress(jobId, { jobId, stage: "error", percent: 0, message: "Cancelled" }, true);
         await redis.del(`job:${jobId}:cancelled`);
+      } else {
+        await publishProgress(jobId, { jobId, stage: "error", percent: 0, message: err.message }, true);
       }
+      publishThrottle.delete(jobId);
       throw err;
     } finally {
       await rm(workDir, { recursive: true, force: true });
@@ -379,4 +505,4 @@ worker.on("completed", (job) => {
   console.log(`✅ Job ${job.id} completed successfully`);
 });
 
-console.log("✅ Worker started (CPU encoding): listening on queue video-transcode");
+console.log("✅ Worker started (GPU h264_nvenc + live progress): listening on queue video-transcode");
