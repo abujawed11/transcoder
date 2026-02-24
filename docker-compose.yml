@@ -15,7 +15,7 @@ services:
       - "9000:9000"
       - "9001:9001"
     volumes:
-      - D:/minio-data:/data
+      - minio-data:/data
 
   worker:
     build: ./worker
@@ -41,3 +41,6 @@ services:
       WS_PORT: "4001"
     depends_on:
       - redis
+
+volumes:
+  minio-data:
