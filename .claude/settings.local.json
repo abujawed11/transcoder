@@ -5,7 +5,8 @@
       "Bash(ls:*)",
       "Bash(cd /d/react/video-transcoder/transcoder/ws-server && npm install 2>&1)",
       "Bash(cd /d/react/video-transcoder/transcoder && npx tsc --noEmit 2>&1)",
-      "Bash(echo EXIT:$?:*)"
+      "Bash(echo EXIT:$?:*)",
+      "Bash(docker exec:*)"
     ]
   }
 }
