@@ -13,7 +13,9 @@ type FileUploadStatus = "pending" | "uploading" | "uploaded" | "transcoding" | "
 
 interface FileUploadState {
   id: string;
-  file: File;
+  file: File | null;  // null for entries restored from localStorage
+  fileName: string;
+  fileSize: number;
   status: FileUploadStatus;
   progress: number;
   message: string;
@@ -96,6 +98,45 @@ export default function HomePage() {
   useEffect(() => {
     localStorage.setItem("transcodeSettings", JSON.stringify(settings));
   }, [settings]);
+
+  // Tracks whether we've finished restoring from localStorage.
+  // Must be declared before the save/load effects so both closures share the same ref.
+  const hasRestoredJobsRef = useRef(false);
+
+  // Persist jobs to localStorage whenever files changes (skip until after restoration).
+  // This effect is intentionally listed BEFORE the load effect so it runs first on mount
+  // with hasRestoredJobsRef=false → skips → avoids wiping stored data before load runs.
+  useEffect(() => {
+    if (!hasRestoredJobsRef.current) return;
+    const serializable = files.map(({ file, ...rest }) => rest);
+    localStorage.setItem("uploadJobs", JSON.stringify(serializable));
+  }, [files]);
+
+  // Restore persisted jobs from localStorage on first mount.
+  // Runs after the save effect on first mount (React runs effects top-to-bottom).
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem("uploadJobs");
+      if (saved) {
+        const parsed: Omit<FileUploadState, "file">[] = JSON.parse(saved);
+        const restored: FileUploadState[] = parsed.map((f) => ({
+          ...f,
+          file: null,
+          // Uploading/pending jobs can't be resumed without the File object
+          status: (["uploading", "pending", "uploaded"] as FileUploadStatus[]).includes(f.status)
+            ? "error"
+            : f.status,
+          message: (["uploading", "pending", "uploaded"] as FileUploadStatus[]).includes(f.status)
+            ? "Upload interrupted — please re-add the file"
+            : f.message,
+        }));
+        if (restored.length > 0) setFiles(restored);
+      }
+    } catch {
+      // Ignore corrupt storage
+    }
+    hasRestoredJobsRef.current = true;
+  }, []);
 
   const updateFileState = useCallback((id: string, updates: Partial<FileUploadState>) => {
     setFiles(prev => prev.map(f => f.id === id ? { ...f, ...updates } : f));
@@ -243,6 +284,10 @@ export default function HomePage() {
 
   async function uploadSingleFile(fileState: FileUploadState): Promise<void> {
     const { id, file } = fileState;
+    if (!file) {
+      updateFileState(id, { status: "error", message: "File not available — please re-add it" });
+      return;
+    }
     const controller = new AbortController();
     abortControllers.current.set(id, controller);
 
@@ -418,6 +463,8 @@ export default function HomePage() {
     const newFiles: FileUploadState[] = videoFiles.map((file) => ({
       id: `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
       file,
+      fileName: file.name,
+      fileSize: file.size,
       status: "pending" as FileUploadStatus,
       progress: 0,
       message: "Ready to upload",
@@ -929,13 +976,13 @@ export default function HomePage() {
                 </div>
 
                 <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontSize: 14, fontWeight: 500, color: "#e4e4e7", marginBottom: 4, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={fileState.file.name}>
-                    {truncateFilename(fileState.file.name)}
+                  <div style={{ fontSize: 14, fontWeight: 500, color: "#e4e4e7", marginBottom: 4, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={fileState.fileName}>
+                    {truncateFilename(fileState.fileName)}
                   </div>
                   <div style={{ fontSize: 12, color: "#71717a", display: "flex", gap: 8, alignItems: "center" }}>
-                    <span>{formatFileSize(fileState.file.size)}</span>
+                    <span>{formatFileSize(fileState.fileSize)}</span>
                     <span style={{ opacity: 0.4 }}>•</span>
-                    <span>{Math.ceil(fileState.file.size / CHUNK_SIZE)} chunks</span>
+                    <span>{Math.ceil(fileState.fileSize / CHUNK_SIZE)} chunks</span>
                   </div>
                 </div>
 
