@@ -462,6 +462,22 @@ const worker = new Worker(
       job.updateProgress(100);
       console.log(`🎉 Job ${jobId} completed!`);
 
+      // ── Stage: thumbnail ─────────────────────────────────────────────────
+      let thumbnailKey = null;
+      try {
+        const thumbPath = path.join(workDir, "thumb.jpg");
+        const thumbTime = (videoInfo.duration * 0.05).toFixed(2);
+        await execFileAsync("ffmpeg", [
+          "-y", "-ss", thumbTime, "-i", inputPath,
+          "-vframes", "1", "-vf", "scale=640:-1", "-q:v", "3", thumbPath,
+        ]);
+        thumbnailKey = `thumbnails/${jobId}.jpg`;
+        await uploadObject(thumbnailKey, thumbPath, "image/jpeg");
+        console.log(`🖼️ Thumbnail uploaded: ${thumbnailKey}`);
+      } catch (e) {
+        console.warn(`⚠️ Thumbnail generation failed for job ${jobId}:`, e.message);
+      }
+
       // ── Stage: done ──────────────────────────────────────────────────────
       await publishProgress(jobId, { jobId, stage: "done", percent: 100, message: "Transcoding complete" }, true);
       await redis.del(`job:${jobId}:cancelled`);
@@ -478,6 +494,7 @@ const worker = new Worker(
         outputs: Object.fromEntries(
           Object.entries(outputs).map(([q, { s3Key, size }]) => [q, { key: s3Key, size }])
         ),
+        thumbnailKey,
       };
     } catch (err) {
       if (err.message === "CANCELLED") {
