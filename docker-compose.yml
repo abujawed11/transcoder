@@ -27,6 +27,14 @@ services:
       S3_BUCKET: video-app
       S3_ACCESS_KEY: minioadmin
       S3_SECRET_KEY: minioadmin123
+      FFMPEG_ENCODER: ${FFMPEG_ENCODER:-h264_nvenc}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     depends_on:
       - redis
       - minio

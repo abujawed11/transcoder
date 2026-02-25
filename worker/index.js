@@ -219,37 +219,20 @@ function killProcessesForJob(jobId) {
 function buildFfmpegArgs(inputPath, outputPath, preset, settings) {
   const { crf } = settings;
 
-  // // GPU encoding (h264_nvenc) — requires NVIDIA GPU + nvenc support
-  // return [
-  //   "-y",
-  //   "-progress", "pipe:1",  // structured progress → stdout
-  //   "-nostats",             // suppress normal stats from stderr
-  //   "-i", inputPath,
-  //   "-vf", `scale=-2:${preset.height}`,
-  //   "-c:v", "h264_nvenc",
-  //   "-preset", "p4",        // p1 (fastest) … p7 (best quality)
-  //   "-rc", "vbr",           // variable bitrate quality mode
-  //   "-cq", String(crf),     // quality target (like CRF for libx264)
-  //   "-b:v", "0",            // required: no fixed bitrate target, let -cq control quality
-  //   "-maxrate", preset.maxBitrate,
-  //   "-bufsize", preset.maxBitrate,
-  //   "-c:a", "aac",
-  //   "-b:a", preset.audioBitrate,
-  //   "-ac", "2",
-  //   "-movflags", "+faststart",
-  //   outputPath,
-  // ];
+  const encoder = process.env.FFMPEG_ENCODER || "libx264";
+  const useGpu = encoder === "h264_nvenc";
 
-  // CPU encoding (libx264) — works in Docker without GPU
   return [
     "-y",
-    "-progress", "pipe:1",  // structured progress → stdout
-    "-nostats",             // suppress normal stats from stderr
+    "-progress", "pipe:1",
+    "-nostats",
     "-i", inputPath,
     "-vf", `scale=-2:${preset.height}`,
-    "-c:v", "libx264",
-    "-preset", "fast",
-    "-crf", String(crf),
+    "-c:v", encoder,
+    ...(useGpu
+      ? ["-preset", "p4", "-rc", "vbr", "-cq", String(crf), "-b:v", "0"]
+      : ["-preset", "fast", "-crf", String(crf)]
+    ),
     "-maxrate", preset.maxBitrate,
     "-bufsize", preset.maxBitrate,
     "-c:a", "aac",
@@ -525,4 +508,5 @@ worker.on("completed", (job) => {
   console.log(`✅ Job ${job.id} completed successfully`);
 });
 
-console.log("✅ Worker started (CPU libx264 + live progress): listening on queue video-transcode");
+const encoder = process.env.FFMPEG_ENCODER || "libx264";
+console.log(`✅ Worker started (encoder: ${encoder} + live progress): listening on queue video-transcode`);
