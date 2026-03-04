@@ -67,6 +67,7 @@ const QUALITY_INFO: Record<string, string> = {
 
 export default function HomePage() {
   const [files, setFiles] = useState<FileUploadState[]>([]);
+  const [jobsLoaded, setJobsLoaded] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
@@ -99,44 +100,32 @@ export default function HomePage() {
     localStorage.setItem("transcodeSettings", JSON.stringify(settings));
   }, [settings]);
 
-  // Tracks whether we've finished restoring from localStorage.
-  // Must be declared before the save/load effects so both closures share the same ref.
-  const hasRestoredJobsRef = useRef(false);
-
-  // Persist jobs to localStorage whenever files changes (skip until after restoration).
-  // This effect is intentionally listed BEFORE the load effect so it runs first on mount
-  // with hasRestoredJobsRef=false → skips → avoids wiping stored data before load runs.
-  useEffect(() => {
-    if (!hasRestoredJobsRef.current) return;
-    const serializable = files.map(({ file, ...rest }) => rest);
-    localStorage.setItem("uploadJobs", JSON.stringify(serializable));
-  }, [files]);
-
   // Restore persisted jobs from localStorage on first mount.
-  // Runs after the save effect on first mount (React runs effects top-to-bottom).
+  // setFiles + setJobsLoaded are batched by React 18 into a single re-render.
   useEffect(() => {
     try {
       const saved = localStorage.getItem("uploadJobs");
       if (saved) {
         const parsed: Omit<FileUploadState, "file">[] = JSON.parse(saved);
-        const restored: FileUploadState[] = parsed.map((f) => ({
-          ...f,
-          file: null,
-          // Uploading/pending jobs can't be resumed without the File object
-          status: (["uploading", "pending", "uploaded"] as FileUploadStatus[]).includes(f.status)
-            ? "error"
-            : f.status,
-          message: (["uploading", "pending", "uploaded"] as FileUploadStatus[]).includes(f.status)
-            ? "Upload interrupted — please re-add the file"
-            : f.message,
-        }));
+        const restored: FileUploadState[] = parsed.map((f) => ({ ...f, file: null }));
         if (restored.length > 0) setFiles(restored);
       }
     } catch {
       // Ignore corrupt storage
     }
-    hasRestoredJobsRef.current = true;
+    setJobsLoaded(true);
   }, []);
+
+  // Persist only jobs that have a jobId (transcoding/completed/cancelled).
+  // Depends on jobsLoaded so it never runs until after restore completes,
+  // preventing an empty-files render from wiping localStorage.
+  useEffect(() => {
+    if (!jobsLoaded) return;
+    const serializable = files
+      .filter((f) => !!f.jobId)
+      .map(({ file, ...rest }) => rest);
+    localStorage.setItem("uploadJobs", JSON.stringify(serializable));
+  }, [files, jobsLoaded]);
 
   const updateFileState = useCallback((id: string, updates: Partial<FileUploadState>) => {
     setFiles(prev => prev.map(f => f.id === id ? { ...f, ...updates } : f));
